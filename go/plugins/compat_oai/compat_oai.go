@@ -75,6 +75,24 @@ type OpenAICompatible struct {
 	// This should be used if you are running through a proxy or
 	// using a non-official endpoint
 	BaseURL string
+
+	// OnAssistantMessage, if set, is called when building an OpenAI assistant message.
+	// Plugins can use this to add provider-specific extra fields on the assistant message
+	// (e.g., reasoning_content for DeepSeek multi-round conversations).
+	// msg contains the original genkit message parts; am is the assistant message param being built.
+	OnAssistantMessage func(msg *ai.Message, am *openai.ChatCompletionAssistantMessageParam)
+
+	// OnStreamChunk, if set, is called for each streaming chunk delta received from the API.
+	// Plugins can use this to extract provider-specific extra fields from the delta
+	// (e.g., reasoning_content in DeepSeek thinking mode).
+	// Returns additional content parts to append to the streaming chunk.
+	OnStreamChunk func(ctx context.Context, chunk *openai.ChatCompletionChunk) []*ai.Part
+
+	// OnResponse, if set, is called when converting a complete ChatCompletion to a ModelResponse.
+	// Plugins can use this to extract provider-specific extra fields from the response message
+	// (e.g., reasoning_content in DeepSeek thinking mode).
+	// Returns additional content parts to append to the response message.
+	OnResponse func(ctx context.Context, completion *openai.ChatCompletion) []*ai.Part
 }
 
 // Init implements genkit.Plugin.
@@ -120,7 +138,11 @@ func (o *OpenAICompatible) DefineModel(provider, id string, opts ai.ModelOptions
 		cb func(context.Context, *ai.ModelResponseChunk) error,
 	) (*ai.ModelResponse, error) {
 		// Configure the response generator with input
-		generator := NewModelGenerator(o.client, id).WithMessages(input.Messages).WithConfig(input.Config).WithTools(input.Tools)
+		generator := NewModelGenerator(o.client, id).
+			WithMessages(input.Messages).
+			WithConfig(input.Config).
+			WithTools(input.Tools).
+			WithHooks(o.OnAssistantMessage, o.OnStreamChunk, o.OnResponse)
 
 		// Generate response
 		resp, err := generator.Generate(ctx, input, cb)

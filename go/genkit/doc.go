@@ -47,7 +47,7 @@ Generate text with a simple prompt:
 # Models
 
 Models represent AI language models that generate content. Use plugins to access
-models from providers like Google AI, Vertex AI, Anthropic, or Ollama. Models are
+models from providers like Google AI, Vertex AI, Anthropic, DeepSeek, or Ollama. Models are
 referenced by name and can include provider-specific configuration:
 
 	resp, err := genkit.Generate(ctx, g,
@@ -298,6 +298,7 @@ retrievers, and other capabilities. Common plugins include:
 
   - googlegenai: Google AI (Gemini models)
   - vertexai: Google Cloud Vertex AI
+  - deepseek: DeepSeek AI (V4-Flash, V4-Pro)
   - ollama: Local Ollama models
 
 Initialize plugins during [Init]:

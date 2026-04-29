@@ -36,6 +36,11 @@ type ModelGenerator struct {
 	toolChoice openai.ChatCompletionToolChoiceOptionUnionParam
 	// Store any errors that occur during building
 	err error
+
+	// Hooks for provider-specific customization
+	onAssistantMessage func(msg *ai.Message, am *openai.ChatCompletionAssistantMessageParam)
+	onStreamChunk      func(ctx context.Context, chunk *openai.ChatCompletionChunk) []*ai.Part
+	onResponse         func(ctx context.Context, completion *openai.ChatCompletion) []*ai.Part
 }
 
 func (g *ModelGenerator) GetRequest() *openai.ChatCompletionNewParams {
@@ -51,6 +56,18 @@ func NewModelGenerator(client *openai.Client, modelName string) *ModelGenerator 
 			Model: (modelName),
 		},
 	}
+}
+
+// WithHooks sets optional hooks for provider-specific message/response customization.
+func (g *ModelGenerator) WithHooks(
+	onAssistantMessage func(msg *ai.Message, am *openai.ChatCompletionAssistantMessageParam),
+	onStreamChunk func(ctx context.Context, chunk *openai.ChatCompletionChunk) []*ai.Part,
+	onResponse func(ctx context.Context, completion *openai.ChatCompletion) []*ai.Part,
+) *ModelGenerator {
+	g.onAssistantMessage = onAssistantMessage
+	g.onStreamChunk = onStreamChunk
+	g.onResponse = onResponse
+	return g
 }
 
 // WithMessages adds messages to the request
@@ -73,6 +90,11 @@ func (g *ModelGenerator) WithMessages(messages []*ai.Message) *ModelGenerator {
 		case ai.RoleModel:
 			am := openai.ChatCompletionAssistantMessageParam{}
 			am.Content.OfString = param.NewOpt(content)
+			// Allow plugins to customize the assistant message
+			// (e.g., add reasoning_content for DeepSeek multi-round conversations).
+			if g.onAssistantMessage != nil {
+				g.onAssistantMessage(msg, &am)
+			}
 			toolCalls, err := convertToolCalls(msg.Content)
 			if err != nil {
 				g.err = err
@@ -266,10 +288,14 @@ func getResponseFormat(output *ai.ModelOutputConfig) openai.ChatCompletionNewPar
 	return format
 }
 
-// concatenateContent concatenates text content into a single string
+// concatenateContent concatenates text content into a single string,
+// skipping reasoning parts which are handled separately.
 func (g *ModelGenerator) concatenateContent(parts []*ai.Part) string {
 	content := ""
 	for _, part := range parts {
+		if part.IsReasoning() {
+			continue
+		}
 		content += part.Text
 	}
 	return content
@@ -299,6 +325,12 @@ func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(co
 			modelChunk.Content = append(modelChunk.Content, ai.NewTextPart(chunk.Choices[0].Delta.Content))
 		}
 
+		// Allow plugins to extract provider-specific content from streaming deltas
+		// (e.g., reasoning_content for DeepSeek thinking mode).
+		if g.onStreamChunk != nil {
+			modelChunk.Content = append(modelChunk.Content, g.onStreamChunk(ctx, &chunk)...)
+		}
+
 		// Handle tool call deltas
 		for _, toolCall := range chunk.Choices[0].Delta.ToolCalls {
 			// Send the incremental tool call part in the chunk
@@ -324,11 +356,16 @@ func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(co
 	}
 
 	// Convert accumulated ChatCompletion to ai.ModelResponse
-	return convertChatCompletionToModelResponse(&acc.ChatCompletion)
+	resp, err := convertChatCompletionToModelResponse(ctx, &acc.ChatCompletion, g.onResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 // convertChatCompletionToModelResponse converts openai.ChatCompletion to ai.ModelResponse
-func convertChatCompletionToModelResponse(completion *openai.ChatCompletion) (*ai.ModelResponse, error) {
+func convertChatCompletionToModelResponse(ctx context.Context, completion *openai.ChatCompletion, onResponse func(context.Context, *openai.ChatCompletion) []*ai.Part) (*ai.ModelResponse, error) {
 	if len(completion.Choices) == 0 {
 		return nil, fmt.Errorf("no choices in completion")
 	}
@@ -408,6 +445,12 @@ func convertChatCompletionToModelResponse(completion *openai.ChatCompletion) (*a
 		resp.Message.Content = append(resp.Message.Content, ai.NewTextPart(choice.Message.Content))
 	}
 
+	// Add reasoning content via hook (e.g., DeepSeek thinking mode).
+	// Plugins can extract provider-specific extra fields from the response message.
+	if onResponse != nil {
+		resp.Message.Content = append(resp.Message.Content, onResponse(ctx, completion)...)
+	}
+
 	// Add tool calls
 	for _, toolCall := range choice.Message.ToolCalls {
 		args, err := jsonStringToMap(toolCall.Function.Arguments)
@@ -440,7 +483,7 @@ func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequ
 		return nil, fmt.Errorf("failed to create completion: %w", err)
 	}
 
-	resp, err := convertChatCompletionToModelResponse(completion)
+	resp, err := convertChatCompletionToModelResponse(ctx, completion, g.onResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -504,4 +547,15 @@ func anyToJSONString(data any) (string, error) {
 		return "", fmt.Errorf("failed to marshal any to JSON string: data, %#v %w", data, err)
 	}
 	return string(jsonBytes), nil
+}
+
+// unquoteJSONString removes surrounding JSON quotes from a raw JSON string value.
+// For example, `"hello"` becomes `hello`. If the input is not a valid JSON string,
+// it returns the input unchanged.
+func unquoteJSONString(raw string) string {
+	var s string
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return raw
+	}
+	return s
 }
